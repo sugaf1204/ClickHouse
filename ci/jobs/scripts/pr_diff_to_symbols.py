@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import io
-import os
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
 
 try:
     from unidiff import PatchSet
@@ -16,67 +16,155 @@ except Exception as exc:
     sys.exit(2)
 
 
-def fetch(url: str) -> bytes:
-    with urllib.request.urlopen(url) as resp:
-        return resp.read()
+class DiffToSymbols:
+    def __init__(self, clickhouse_path: str, pr_number: int):
+        if Path(clickhouse_path).is_dir():
+            self.clickhouse_path = clickhouse_path + "/clickhouse"
+        else:
+            self.clickhouse_path = clickhouse_path
+        # TODO: add support for non api mode (from git)
+        self.pr_number = pr_number
+        assert self.pr_number > 0, "Works only for PRs"
+        assert Path(
+            self.clickhouse_path
+        ).is_file(), f"clickhouse binary not found at {self.clickhouse_path}"
 
+    @staticmethod
+    def fetch(url: str) -> bytes:
+        with urllib.request.urlopen(url) as resp:
+            return resp.read()
 
-def parse_diff_to_csv(diff_bytes: bytes) -> str:
-    patch = PatchSet(diff_bytes.decode("utf-8", errors="ignore"))
-    out = io.StringIO()
-    out.write("filename,line\n")
-    exts = (".cpp", ".cc", ".cxx", ".c", ".hpp", ".hh", ".hxx", ".h", ".ipp")
-    for f in patch:
-        if not f.path.endswith(exts):
-            continue
-        for hunk in f:
-            for line in hunk:
-                if line.is_added:
-                    out.write("{},{}\n".format(f.path, line.target_line_no))
-    return out.getvalue()
+    @staticmethod
+    def parse_diff_to_csv(diff_bytes: bytes) -> str:
+        patch = PatchSet(diff_bytes.decode("utf-8", errors="ignore"))
+        out = io.StringIO()
+        out.write("filename,line\n")
+        exts = (".cpp", ".cc", ".cxx", ".c", ".hpp", ".hh", ".hxx", ".h", ".ipp")
+        for f in patch:
+            if not f.path.endswith(exts):
+                continue
+            for hunk in f:
+                for line in hunk:
+                    if line.is_added:
+                        out.write("{},{}\n".format(f.path, line.target_line_no))
+        return out.getvalue()
 
-
-def run_query(clickhouse_path: str, csv_payload: str) -> str:
-    # Use the binary itself as the DWARF source
-    ch_path_sql = clickhouse_path.replace("'", "\\'")
-    query = (
+    @staticmethod
+    def parse_diff_to_line_numbers(diff_bytes: bytes) -> list:
         """
-    SELECT
-        groupUniqArray(empty(linkage_name)
-            ? demangle(addressToSymbol(address))
-            : demangle(linkage_name) AS symbol)
-    FROM file('stdin', 'CSVWithNames', 'filename String, line UInt32') AS diff
-    ASOF JOIN
-    (
+        Returns list of tuples (filename, line_number) for added, removed changed,lines
+        """
+        patch = PatchSet(diff_bytes.decode("utf-8", errors="ignore"))
+        result = []
+        exts = (".cpp", ".cc", ".cxx", ".c", ".hpp", ".hh", ".hxx", ".h", ".ipp")
+        for f in patch:
+            if not f.path.endswith(exts):
+                continue
+            for hunk in f:
+                for line in hunk:
+                    if line.is_added:
+                        # Added lines use target line number (new file)
+                        result.append((f.path, line.target_line_no))
+                    elif line.is_removed:
+                        # Removed lines use source line number (old file)
+                        result.append((f.path, line.source_line_no))
+        return result
+
+    def run_query(self, line_numbers: list) -> dict:
+        """
+        Execute ClickHouse query with list of (filename, line_number) tuples.
+
+        Args:
+            line_numbers: List of tuples (filename, line_number)
+
+        Returns:
+            Dictionary mapping (filename, line_number) to (address, symbol)
+            Example: {('src/foo.cpp', 42): (0x12345, 'myFunction()')}
+        """
+        # Convert list of tuples to CSV format for ClickHouse stdin
+        out = io.StringIO()
+        out.write("filename,line\n")
+        for filename, line_no in line_numbers:
+            out.write("{},{}\n".format(filename, line_no))
+        csv_payload = out.getvalue()
+
+        query = (
+            """
         SELECT
-            decl_file,
-            decl_line,
-            linkage_name,
-            ranges[1].1 AS address
-        FROM file('{ch_path}', 'DWARF')
-        WHERE (tag = 'subprogram') AND (notEmpty(linkage_name) OR address != 0) AND notEmpty(decl_file)
-    ) AS binary
-    ON basename(diff.filename) = basename(binary.decl_file) AND diff.line >= binary.decl_line
-    FORMAT TSV
-        """.format(
-            ch_path=ch_path_sql
+            diff.filename,
+            diff.line,
+            binary.address,
+            binary.linkage_name,
+            if(empty(binary.linkage_name),
+                demangle(addressToSymbol(binary.address)),
+                demangle(binary.linkage_name)) AS symbol
+        FROM file('stdin', 'CSVWithNames', 'filename String, line UInt32') AS diff
+        ASOF LEFT JOIN
+        (
+            SELECT
+                decl_file,
+                decl_line,
+                linkage_name,
+                ranges[1].1 AS address
+            FROM file('{ch_path}', 'DWARF')
+            WHERE (tag = 'subprogram') AND (notEmpty(linkage_name) OR address != 0) AND notEmpty(decl_file)
+        ) AS binary
+        ON basename(diff.filename) = basename(binary.decl_file) AND diff.line >= binary.decl_line
+        FORMAT TSV
+            """.format(
+                ch_path=self.clickhouse_path
+            )
+        ).strip()
+
+        proc = subprocess.run(
+            [self.clickhouse_path, "local", "--query", query],
+            input=csv_payload,
+            text=True,
+            capture_output=True,
+            check=False,
         )
-    ).strip()
+        if proc.returncode != 0:
+            print(proc.stderr, file=sys.stderr)
+            raise SystemExit(proc.returncode)
 
-    proc = subprocess.run(
-        [clickhouse_path, "local", "--query", query],
-        input=csv_payload,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        print(proc.stderr, file=sys.stderr)
-        raise SystemExit(proc.returncode)
-    return proc.stdout
+        # Parse TSV output into dictionary
+        result = {}
+        for line in proc.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 5:
+                filename, line_no, address, linkage_name, symbol = (
+                    parts[0],
+                    parts[1],
+                    parts[2],
+                    parts[3],
+                    parts[4],
+                )
+                result[(filename, int(line_no))] = (address, linkage_name, symbol)
+            elif len(parts) >= 2:
+                # Handle case where no match was found (LEFT JOIN)
+                filename, line_no = parts[0], parts[1]
+                result[(filename, int(line_no))] = (None, None, None)
+
+        return result
+
+    def get_file_with_line_numbers(self):
+        diff_url = f"https://patch-diff.githubusercontent.com/raw/ClickHouse/ClickHouse/pull/{self.pr_number}.diff"
+        diff_bytes = self.fetch(diff_url)
+        return self.parse_diff_to_line_numbers(diff_bytes)
+
+    def get_symbols(self, line_and_numbers):
+        """
+        Get symbols mapping for changed lines.
+
+        Returns:
+            Dictionary mapping (filename, line_number) to (address, symbol)
+        """
+        return self.run_query(line_and_numbers)
 
 
-def main() -> None:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="List changed symbols for a PR by parsing diff and querying ClickHouse."
     )
@@ -86,28 +174,13 @@ def main() -> None:
         help='Path to clickhouse binary (will be executed as "clickhouse local")',
     )
     args = parser.parse_args()
-
-    diff_url = "https://patch-diff.githubusercontent.com/raw/ClickHouse/ClickHouse/pull/{}.diff".format(
-        args.pr
-    )
-    diff_bytes = fetch(diff_url)
-
-    csv_payload = parse_diff_to_csv(diff_bytes)
-
-    ch_path = os.path.abspath(args.clickhouse_path)
-    if not os.path.exists(ch_path):
-        print("ClickHouse binary not found at {}".format(ch_path), file=sys.stderr)
-        sys.exit(1)
-    if not os.access(ch_path, os.X_OK) or not os.path.isfile(ch_path):
-        print(
-            "ClickHouse path must be an executable file: {}".format(ch_path),
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    output = run_query(ch_path, csv_payload)
-    sys.stdout.write(output)
-
-
-if __name__ == "__main__":
-    main()
+    dts = DiffToSymbols(args.clickhouse_path, int(args.pr))
+    file_with_line_numbers = dts.get_file_with_line_numbers()
+    output = dts.get_symbols(file_with_line_numbers)
+    symbols = set()
+    for (file, line), (address, linkage_name, symbol) in output.items():
+        if not address and not linkage_name:
+            print(f"{file}:{line} ->\n     NOT RESOLVED")
+        if symbol not in symbols:
+            symbols.add(symbol)
+            print(f"{file}:{line} ->\n     {symbol}")
