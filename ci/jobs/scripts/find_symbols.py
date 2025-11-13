@@ -35,21 +35,6 @@ class DiffToSymbols:
             return resp.read()
 
     @staticmethod
-    def parse_diff_to_csv(diff_bytes: bytes) -> str:
-        patch = PatchSet(diff_bytes.decode("utf-8", errors="ignore"))
-        out = io.StringIO()
-        out.write("filename,line\n")
-        exts = (".cpp", ".cc", ".cxx", ".c", ".hpp", ".hh", ".hxx", ".h", ".ipp")
-        for f in patch:
-            if not f.path.endswith(exts):
-                continue
-            for hunk in f:
-                for line in hunk:
-                    if line.is_added:
-                        out.write("{},{}\n".format(f.path, line.target_line_no))
-        return out.getvalue()
-
-    @staticmethod
     def parse_diff_to_line_numbers(diff_bytes: bytes) -> list:
         """
         Returns list of tuples (filename, line_number) for added, removed changed,lines
@@ -154,14 +139,18 @@ class DiffToSymbols:
         diff_bytes = self.fetch(diff_url)
         return self.parse_diff_to_line_numbers(diff_bytes)
 
-    def get_symbols(self, line_and_numbers):
+    def get_map_line_to_symbol(self):
         """
         Get symbols mapping for changed lines.
 
         Returns:
-            Dictionary mapping (filename, line_number) to (address, symbol)
+            Dictionary mapping (filename, line_number) to (address, linkage_name,symbol)
+            Emty dict if no changes in source code
         """
-        return self.run_query(line_and_numbers)
+        file_with_line_numbers = self.get_file_with_line_numbers()
+        if not file_with_line_numbers:
+            return {}
+        return self.run_query(file_with_line_numbers)
 
 
 if __name__ == "__main__":
@@ -175,12 +164,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     dts = DiffToSymbols(args.clickhouse_path, int(args.pr))
-    file_with_line_numbers = dts.get_file_with_line_numbers()
-    output = dts.get_symbols(file_with_line_numbers)
+    output = dts.get_map_line_to_symbol()
     symbols = set()
+    print("\n")
     for (file, line), (address, linkage_name, symbol) in output.items():
         if not address and not linkage_name:
-            print(f"{file}:{line} ->\n     NOT RESOLVED")
+            print(f"{file}:{line} ->\n     NOT RESOLVED\n")
         if symbol not in symbols:
             symbols.add(symbol)
-            print(f"{file}:{line} ->\n     {symbol}")
+            print(f"{file}:{line} ->\n     {symbol}\n")

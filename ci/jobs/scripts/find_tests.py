@@ -3,10 +3,12 @@ import os
 import re
 import sys
 from pathlib import Path
+import argparse
+from random import sample
 
 sys.path.append("./")
 
-from ci.jobs.scripts.pr_diff_to_symbols import DiffToSymbols
+from ci.jobs.scripts.find_symbols import DiffToSymbols
 from ci.praktika.cidb import CIDB
 from ci.praktika.info import Info
 from ci.praktika.result import Result
@@ -108,18 +110,17 @@ class Targeting:
     def get_changed_symbols_with_info(self, path):
         name = "changed_symbols"
         dts = DiffToSymbols(path, self.info.pr_number)
-        file_with_line_numbers = dts.get_file_with_line_numbers()
-        if not file_with_line_numbers:
+        file_no_to_address_symbol = dts.get_map_line_to_symbol()
+        if not file_no_to_address_symbol:
             return [], Result(
                 name=name,
                 status=Result.StatusExtended.OK,
                 info="No changes in source files",
             )
-
-        file_no_to_address_symbol = dts.get_symbols(file_with_line_numbers)
         symbols = set()
         map_results = []
         all_resolved = True
+        not_resolved_file_line_map = {}
         for (file_, line_), (
             address,
             linkage_name,
@@ -129,39 +130,31 @@ class Targeting:
                 continue
             if not symbol:
                 all_resolved = False
-                map_results.append(
-                    Result(
-                        name=f"{file_}:{line_}",
-                        status=Result.StatusExtended.FAIL,
-                        info=f"NOT_RESOLVED, address: [{address}], linkage_name: [{linkage_name}]",
-                    )
-                )
+                if file_ not in not_resolved_file_line_map:
+                    not_resolved_file_line_map[file_] = set()
+                not_resolved_file_line_map[file_].add(line_)
             else:
-                map_results.append(
-                    Result(
-                        name=f"{file_}:{line_}",
-                        status=Result.StatusExtended.OK,
-                        info=symbol,
-                    )
-                )
                 symbols.add(symbol)
-        if not symbols:
-            return [], Result(
-                name=name,
-                status=Result.StatusExtended.FAIL,
-                info="Failed to map any line to symbol",
-            )
-        else:
-            return list(symbols), Result(
-                name=name,
-                status=(
-                    Result.StatusExtended.OK
-                    if all_resolved
-                    else Result.StatusExtended.FAIL
-                ),
-                info=f"Found {len(symbols)} symbols",
-                results=map_results,
-            )
+        info = f"Resolved {len(symbols)} symbols:\n"
+        for symbol in symbols[:10]:
+            info += f" - {symbol}\n"
+        if len(symbols) > 10:
+            info += "...\n"
+        info += "\n"
+        info += (
+            f"Failed to resolve symbols in {len(not_resolved_file_line_map)} files:\n"
+        )
+        for file_, lines in not_resolved_file_line_map.items():
+            for line in lines:
+                if line - 1 in lines:  # skip consequent lines
+                    continue
+                info += f" - {file_}: {line}\n"
+
+        return list(symbols), Result(
+            name=name,
+            status=Result.StatusExtended.OK,
+            info=info,
+        )
 
     def get_tests_by_changed_symbols(self, symbols):
         """
@@ -199,10 +192,8 @@ class Targeting:
         for test in tests[:200]:
             info += f" - {test}\n"
         return tests, Result(
-            name="changed_or_new_tests",
-            status=(
-                Result.StatusExtended.SKIPPED if not tests else Result.StatusExtended.OK
-            ),
+            name="tests that were changed or added",
+            status=Result.StatusExtended.OK,
             info=info,
         )
 
@@ -213,101 +204,95 @@ class Targeting:
         for test in tests[:200]:
             info += f" - {test}\n"
         return tests, Result(
-            name="previously_failed_tests",
-            status=(
-                Result.StatusExtended.SKIPPED if not tests else Result.StatusExtended.OK
-            ),
+            name="tests that failed in previous runs",
+            status=Result.StatusExtended.OK,
             info=info,
         )
 
-    def get_covering_tests_with_info(self, symbols):
+    def get_map_file_line_to_symbol_tests(self, binary_path):
         """
-        Generates a prioritized list of relevant tests based on changed symbols in the codebase.
-
-        This method retrieves tests that cover the provided symbols and applies intelligent
-        filtering to produce a focused test selection that maximizes coverage while staying
-        within reasonable runtime constraints.
-
-        Selection Algorithm:
-        1. **Prioritize specific symbols**: Process symbols with fewer tests first, as they
-           likely represent more targeted, high-value test coverage (better signal-to-noise).
-
-        2. **Limit broad symbols**: If a symbol is covered by more than MAX_TESTS_PER_SYMBOL
-           tests (indicating a very generic symbol like a common utility function), randomly
-           select only RANDOM_TESTS_FOR_BROAD_SYMBOL tests to avoid test explosion.
-
-        3. **Enforce global limit**: Stop adding tests once MAX_TESTS is reached to keep
-           test suite execution time reasonable.
-
-        4. **Final trimming**: If the accumulated tests exceed MAX_TESTS due to partial
-           symbol processing, randomly sample down to exactly MAX_TESTS.
-
-        Args:
-            symbols (list): List of code symbols (function/method names) that changed
-
         Returns:
-            set: Unique set of relevant test names to execute
+            dict: (file, line): (symbol, [tests..])
         """
-        import random
 
-        MAX_TESTS = 1000  # Maximum total tests to return
-        MAX_TESTS_PER_SYMBOL = 100  # Threshold to identify overly broad symbols
-        RANDOM_TESTS_FOR_BROAD_SYMBOL = 10  # Sample size for broad symbols
+        dts = DiffToSymbols(binary_path, self.info.pr_number)
+        file_line_to_address_linkagename_symbol = dts.get_map_line_to_symbol()
+        not_resolved_file_lines = {}
+        symbols_to_file_lines = {}
 
-        # Deduplicate input symbols
-        symbols = list(set(symbols))
+        for (file_, line_), (
+            address,
+            linkage_name,
+            symbol,
+        ) in file_line_to_address_linkagename_symbol.items():
+            if symbol in symbols_to_file_lines:
+                continue
+            if not symbol:
+                if file_ not in not_resolved_file_lines:
+                    not_resolved_file_lines[file_] = set()
+                if line_ - 1 in not_resolved_file_lines[file_]:  # skip consequent lines
+                    continue
+                not_resolved_file_lines[file_].add(line_)
+            else:
+                symbols_to_file_lines[symbol] = (file_, line_)
 
         # Fetch mapping of symbols to tests from coverage database
-        symbol_to_tests = self.get_tests_by_changed_symbols(symbols)
-        relevant_tests = set()
+        symbol_to_tests = self.get_tests_by_changed_symbols(
+            list(symbols_to_file_lines.keys())
+        )
+        map_file_line_to_test = {}
+        for symbol, tests in symbol_to_tests.items():
+            map_file_line_to_test[
+                (symbols_to_file_lines[symbol][0], symbols_to_file_lines[symbol][1])
+            ] = (symbol, tests)
+        for file_, lines in not_resolved_file_lines.items():
+            for line in lines:
+                map_file_line_to_test[(file_, line)] = (None, [])
 
-        # Sort symbols by test count (ascending) - prioritize specific symbols over generic ones
-        symbol_to_tests_list = sorted(symbol_to_tests.items(), key=lambda x: len(x[1]))
+        return map_file_line_to_test
 
-        not_covered_symbols = []
-        results_with_info = []
+    def get_most_relevant_tests(self, binary_path, max_tests_per_symbol=100):
+        """
+        Returns list of unique tests that cover found changed symbols, not more than 'max_tests_per_symbol' tests per symbol.
+        """
 
-        for symbol_ in symbols:
-            tests_ = symbol_to_tests.get(symbol_, [])
-            # Skip symbols with no test coverage
-            if not tests_:
-                not_covered_symbols.append(symbol_)
-                continue
+        file_line_to_symbol_tests = self.get_map_file_line_to_symbol_tests(binary_path)
+        not_resolved_file_lines = {}
+        resolved_file_lines = {}
+        symbols_to_tests = {}
+        selected_tests = set()
 
-            results_with_info.append(Result(name=symbol_, status="FOUND", info=info))
-
-            # Handle overly broad symbols: limit to small random sample
-            if len(tests_) > MAX_TESTS_PER_SYMBOL:
-                tests_to_add = random.sample(
-                    tests_, min(RANDOM_TESTS_FOR_BROAD_SYMBOL, len(tests_))
-                )
-                info = f"Found {len(tests_)} tests - too many, sampled {len(tests_to_add)} of them:"
+        for (file_, line_), (symbol, tests) in file_line_to_symbol_tests.items():
+            if not tests:
+                if (file_, line_) not in not_resolved_file_lines:
+                    not_resolved_file_lines[(file_, line_)] = []
+                not_resolved_file_lines[(file_, line_)] = symbol
             else:
-                # For specific symbols, include all covering tests
-                tests_to_add = tests_
-                info = f"Found {len(tests_)} tests:"
+                if symbol in symbols_to_tests:
+                    continue
+                symbols_to_tests[symbol] = tests
+                resolved_file_lines[(file_, line_)] = (symbol, tests)
 
-            for test in tests_to_add:
-                info += f" - {test}\n"
-
-            # Accumulate tests until we reach the limit
-            for test in tests_to_add:
-                if len(relevant_tests) >= MAX_TESTS:
-                    print(f"Too many test found - limit to {MAX_TESTS}")
-                    break
-                relevant_tests.add(test)
-
-        results_with_info.sort(key=lambda x: x.status, reverse=True)
-
-        return relevant_tests, Result(
-            name="found_by_coverage",
-            status=(
-                Result.StatusExtended.OK
-                if relevant_tests
-                else Result.StatusExtended.SKIPPED
-            ),
-            info=f"Found {len(relevant_tests)} tests covering changed symbols",
-            results=results_with_info,
+        info = "Tests not found for lines:\n"
+        for (file_, line), symbol in not_resolved_file_lines.items():
+            info += f"  {file_}:{line} -> symbol: {symbol[:70] + '...' if symbol else 'NOT FOUND'}\n"
+        info = "Tests found for lines:\n"
+        for (file_, line), (symbol, tests) in resolved_file_lines.items():
+            info += f"  {file_}:{line} -> symbol: {symbol[:70]}...\n"
+            if len(tests) > max_tests_per_symbol:
+                info += (
+                    f" select {max_tests_per_symbol} random tests out of {len(tests)}\n"
+                )
+                tests = sample(tests, max_tests_per_symbol)
+                selected_tests.update(tests)
+            for test in tests[:10]:
+                info += f"  - {test}\n"
+            if len(tests) > 10:
+                info += f"    ... and {len(tests) - 10} more tests\n"
+        info += f"Total unique tests: {len(selected_tests)}\n"
+        selected_tests = list(selected_tests)
+        return selected_tests, Result(
+            name="tests found by coverage", status=Result.StatusExtended.OK, info=info
         )
 
     def get_all_relevant_tests_with_info(self, ch_path):
@@ -319,11 +304,7 @@ class Targeting:
         previously_failed_tests, result = self.get_previously_failed_tests_with_info()
         tests.update(previously_failed_tests)
         results.append(result)
-
-        symbols, result = self.get_changed_symbols_with_info(ch_path)
-        results.append(result)
-
-        covering_tests, result = self.get_covering_tests_with_info(symbols)
+        covering_tests, result = self.get_most_relevant_tests(ch_path)
         tests.update(covering_tests)
         results.append(result)
 
@@ -336,13 +317,39 @@ class Targeting:
 
 
 if __name__ == "__main__":
-    # test:
-    info = Info()
+    # local run tests
+    parser = argparse.ArgumentParser(
+        description="List changed symbols for a PR by parsing diff and querying ClickHouse."
+    )
+    parser.add_argument("pr", help="PR number")
+    parser.add_argument(
+        "clickhouse_path",
+        help='Path to clickhouse binary (will be executed as "clickhouse local")',
+    )
+    args = parser.parse_args()
+
+    class InfoLocalTest:
+        pr_number = int(args.pr)
+        is_local_run = True
+
+    info = InfoLocalTest()
     targeting = Targeting(info)
-    # symbols = targeting.get_changed_symbols(info.path)
-    symbols = [
-        "DB::SLRUCachePolicy<wide::integer<128ul, unsigned int>, DB::MMappedFile, UInt128TrivialHash, DB::EqualWeightFunction<DB::MMappedFile>>::clearImpl()",
-        "DB::SLRUCachePolicy<wide::integer<128ul, unsigned int>, DB::MMappedFile, UInt128TrivialHash, DB::EqualWeightFunction<DB::MMappedFile>>::clearImpl()",
-    ]
-    symbol_to_tests = targeting.get_tests_by_changed_symbols(symbols)
-    print(symbol_to_tests)
+    file_line_to_symbol_tests = targeting.get_map_file_line_to_symbol_tests(
+        args.clickhouse_path
+    )
+
+    print("\nNo tests found for lines:")
+    for (file, line), (symbol, tests) in file_line_to_symbol_tests.items():
+        if tests:
+            continue
+        print(f"{file}:{line} -> symbol [{symbol[:70]}...]")
+
+    print("\nTests found for lines:")
+    for (file, line), (symbol, tests) in file_line_to_symbol_tests.items():
+        if not tests:
+            continue
+        print(f"{file}:{line} -> symbol [{symbol[:70]}...]:")
+        for test in tests[:10]:
+            print(f" - {test}")
+        if len(tests) > 10:
+            print(f" - ... and {len(tests) - 10} more tests")
