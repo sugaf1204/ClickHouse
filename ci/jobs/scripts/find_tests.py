@@ -1,9 +1,9 @@
+import argparse
 import ast
 import os
 import re
 import sys
 from pathlib import Path
-import argparse
 from random import sample
 
 sys.path.append("./")

@@ -3,8 +3,11 @@
 #include <Processors/QueryPlan/RuntimeFilterLookup.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
+#include <Columns/ColumnsCommon.h>
+#include <Columns/ColumnsNumber.h>
 #include <Common/SharedLockGuard.h>
 #include <Common/SharedMutex.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -32,11 +35,13 @@ static void mergeBloomFilters(BloomFilter & destination, const BloomFilter & sou
 static constexpr UInt64 BLOOM_FILTER_SEED = 42;
 
 RuntimeFilter::RuntimeFilter(
+    const String & filter_name_,
     const DataTypePtr & filter_column_target_type_,
     UInt64 exact_values_limit_,
     UInt64 bloom_filter_bytes_,
     UInt64 bloom_filter_hash_functions_)
-    : exact_values_limit(exact_values_limit_)
+    : filter_name(filter_name_)
+    , exact_values_limit(exact_values_limit_)
     , bloom_filter_bytes(bloom_filter_bytes_)
     , bloom_filter_hash_functions(bloom_filter_hash_functions_)
     , filter_column_target_type(filter_column_target_type_)
@@ -112,10 +117,21 @@ void RuntimeFilter::addAllFrom(const RuntimeFilter & source)
     }
 }
 
+size_t countOnes(ColumnPtr values)
+{
+    if (const auto * column_bool = typeid_cast<const ColumnUInt8 *>(values.get()))
+    {
+        return countBytesInFilter(column_bool->getData());
+    }
+    return values->size(); /// TODO: handle other column types
+}
+
 ColumnPtr RuntimeFilter::find(const ColumnWithTypeAndName & values) const
 {
     if (!inserts_are_finished)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to lookup values in runtime filter before builiding it was finished");
+
+    rows_checked += values.column->size();
 
     if (no_elements_in_set)
     {
@@ -131,11 +147,15 @@ ColumnPtr RuntimeFilter::find(const ColumnWithTypeAndName & values) const
             ColumnWithTypeAndName(const_column, filter_column_target_type, String())
         };
         auto single_element_equals_function = FunctionFactory::instance().get("equals", nullptr)->build(equals_args);
-        return single_element_equals_function->execute(equals_args, single_element_equals_function->getResultType(), values.column->size(), /* dry_run = */ false);
+        auto result = single_element_equals_function->execute(equals_args, single_element_equals_function->getResultType(), values.column->size(), /* dry_run = */ false);
+        rows_passed += countOnes(result);
+        return result;
     }
     else if (exact_values)
     {
-        return exact_values->execute({values}, false);
+        auto result = exact_values->execute({values}, false);
+        rows_passed += countOnes(result);
+        return result;
     }
     else
     {
@@ -143,12 +163,16 @@ ColumnPtr RuntimeFilter::find(const ColumnWithTypeAndName & values) const
         auto & dst_data = dst->getData();
         dst_data.resize(values.column->size());
 
+        size_t found_count = 0;
         for (size_t row = 0; row < values.column->size(); ++row)
         {
             /// TODO: optimize: consider replacing hash calculation with vectorized version
             const auto & value = values.column->getDataAt(row);
-            dst_data[row] = bloom_filter->find(value.data, value.size);
+            const bool found = bloom_filter->find(value.data, value.size);
+            found_count += found ? 1 : 0;
+            dst_data[row] = found;
         }
+        rows_passed += found_count;
 
         return dst;
     }
@@ -176,6 +200,12 @@ void RuntimeFilter::switchToBloomFilter()
     insertIntoBloomFilter(exact_values->getSetElements().front());
 
     exact_values.reset();
+}
+
+void RuntimeFilter::logStats() const
+{
+    LOG_TRACE(getLogger("RuntimeFilter"), "Stats for '{}': rows checked {}, rows passed {}",
+        filter_name, rows_checked.load(), rows_passed.load());
 }
 
 using RuntimeFilterPtr = std::shared_ptr<RuntimeFilter>;
@@ -207,6 +237,15 @@ public:
         {
             it->second->finishInsert();
             return it->second;
+        }
+    }
+
+    void logStats() const override
+    {
+        SharedLockGuard g(rw_lock);
+        for (const auto & filter : filters_by_name)
+        {
+            filter.second->logStats();
         }
     }
 

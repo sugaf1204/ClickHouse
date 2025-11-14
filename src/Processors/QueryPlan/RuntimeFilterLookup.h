@@ -12,10 +12,11 @@ namespace DB
 
 /// As long as the number of unique values is small they are stored in a Set but when it grows beyond the limit
 /// the values are moved into a BloomFilter.
-class RuntimeFilter
+class RuntimeFilter final
 {
 public:
     RuntimeFilter(
+        const String & filter_name_,
         const DataTypePtr & filter_column_target_type,
         UInt64 exact_values_limit_,
         UInt64 bloom_filter_bytes_,
@@ -32,10 +33,14 @@ public:
     /// Add all keys from one filter to the other so that destination filter contains the union of both filters.
     void addAllFrom(const RuntimeFilter & source);
 
+    /// Log usage statistics
+    void logStats() const;
+
 private:
     void insertIntoBloomFilter(ColumnPtr values);
     void switchToBloomFilter();
 
+    const String filter_name;
     const UInt64 exact_values_limit;
     const UInt64 bloom_filter_bytes;
     const UInt64 bloom_filter_hash_functions;
@@ -52,6 +57,9 @@ private:
     bool no_elements_in_set = false;
     /// If filter set has just one element then "find(value)" is replaced with "value==element"
     std::optional<Field> single_element_in_set;
+
+    mutable std::atomic<Int64> rows_checked = 0;
+    mutable std::atomic<Int64> rows_passed = 0;
 };
 
 using RuntimeFilterConstPtr = std::shared_ptr<const RuntimeFilter>;
@@ -67,6 +75,9 @@ struct IRuntimeFilterLookup : boost::noncopyable
 
     /// Get filter by name
     virtual RuntimeFilterConstPtr find(const String & name) const = 0;
+
+    /// Log various RuntimeFilter usage statistics such as number of filtered rows
+    virtual void logStats() const {}
 };
 
 using RuntimeFilterLookupPtr = std::shared_ptr<IRuntimeFilterLookup>;
