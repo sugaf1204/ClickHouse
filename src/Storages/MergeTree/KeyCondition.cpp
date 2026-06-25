@@ -38,6 +38,7 @@
 #include <IO/Operators.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <stack>
 #include <limits>
@@ -1479,6 +1480,7 @@ public:
     FunctionWithOptionalConstArg(const FunctionBasePtr & func_, const ColumnWithTypeAndName & const_arg_, Kind kind_)
         : func(func_), const_arg(const_arg_), kind(kind_)
     {
+        initializeDateTimeTypesWithTimeZone();
     }
 
     String getName() const override { return func->getName(); }
@@ -1522,30 +1524,28 @@ public:
 
     IFunctionBase::Monotonicity getMonotonicityForRange(const IDataType & type, const Field & left, const Field & right) const override
     {
-        if (const auto * adaptor = typeid_cast<const FunctionToFunctionBaseAdaptor *>(func.get()))
+        if (date_time_type_with_time_zone)
         {
-            if (dynamic_cast<FunctionDateOrDateTimeBase *>(adaptor->getFunction().get()) && kind == Kind::RIGHT_CONST)
+            const IDataType * type_ptr = &type;
+            if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type_ptr))
+                type_ptr = low_cardinality_type->getDictionaryType().get();
+
+            if (type_ptr->isNullable())
+                type_ptr = static_cast<const DataTypeNullable &>(*type_ptr).getNestedType().get();
+
+            if (typeid_cast<const DataTypeDateTime *>(type_ptr))
+                return func->getMonotonicityForRange(*date_time_type_with_time_zone, left, right);
+
+            if (const auto * dt64 = typeid_cast<const DataTypeDateTime64 *>(type_ptr))
             {
-                auto time_zone = extractTimeZoneNameFromColumn(const_arg.column.get(), const_arg.name);
-
-                const IDataType * type_ptr = &type;
-                if (const auto * low_cardinality_type = typeid_cast<const DataTypeLowCardinality *>(type_ptr))
-                    type_ptr = low_cardinality_type->getDictionaryType().get();
-
-                if (type_ptr->isNullable())
-                    type_ptr = static_cast<const DataTypeNullable &>(*type_ptr).getNestedType().get();
-
-                DataTypePtr type_with_time_zone;
-                if (typeid_cast<const DataTypeDateTime *>(type_ptr))
-                    type_with_time_zone = std::make_shared<DataTypeDateTime>(time_zone);
-                else if (const auto * dt64 = typeid_cast<const DataTypeDateTime64 *>(type_ptr))
-                    type_with_time_zone = std::make_shared<DataTypeDateTime64>(dt64->getScale(), time_zone);
-                else
-                    return {}; /// In case we will have other types with time zone
-
-                return func->getMonotonicityForRange(*type_with_time_zone, left, right);
+                const auto scale = dt64->getScale();
+                if (scale < date_time64_types_with_time_zone.size())
+                    return func->getMonotonicityForRange(*date_time64_types_with_time_zone[scale], left, right);
             }
+
+            return {}; /// In case we will have other types with time zone.
         }
+
         return func->getMonotonicityForRange(type, left, right);
     }
 
@@ -1553,9 +1553,30 @@ public:
     const ColumnWithTypeAndName & getConstArg() const { return const_arg; }
 
 private:
+    static constexpr size_t date_time64_scale_count = 10; /// DateTime64 supports scales from 0 to 9.
+
+    void initializeDateTimeTypesWithTimeZone()
+    {
+        if (kind != Kind::RIGHT_CONST)
+            return;
+
+        const auto * adaptor = typeid_cast<const FunctionToFunctionBaseAdaptor *>(func.get());
+        if (!adaptor || !dynamic_cast<FunctionDateOrDateTimeBase *>(adaptor->getFunction().get()))
+            return;
+
+        const auto time_zone = extractTimeZoneNameFromColumn(const_arg.column.get(), const_arg.name);
+        auto date_time_type = std::make_shared<DataTypeDateTime>(time_zone);
+        for (size_t scale = 0; scale < date_time64_types_with_time_zone.size(); ++scale)
+            date_time64_types_with_time_zone[scale] = std::make_shared<DataTypeDateTime64>(scale, *date_time_type);
+
+        date_time_type_with_time_zone = std::move(date_time_type);
+    }
+
     FunctionBasePtr func;
     ColumnWithTypeAndName const_arg;
     Kind kind = Kind::NO_CONST;
+    DataTypePtr date_time_type_with_time_zone;
+    std::array<DataTypePtr, date_time64_scale_count> date_time64_types_with_time_zone;
 };
 
 DataTypePtr getArgumentTypeOfMonotonicFunction(const IFunctionBase & func)
